@@ -4,8 +4,10 @@ PWD="$(pwd)"
 GIT="$(which git)"
 MAKE="$(which gmake)"
 GCC="$(which gcc)"
+CLANG="$(which clang)"
+LLC="$(which llc)"
 
-PREPARE=
+BUILDDEPS=1
 
 XDPTOOLS_PATH="${PWD}/xdp-tools"
 XDPTOOLS_CONFIGURE="${XDPTOOLS_PATH}/configure"
@@ -83,16 +85,16 @@ function build_xdpsock_app()
 	local libxdp_headers="${XDPTOOLS_PATH}/lib/libxdp"
 
 	# Build xdpsock user app
-	local build_cmd="-I. -I${libxdp_headers} -I${libbpf_headers} -o ${usrobj} ${usrsrc}"
+	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers} -Wall -g -O2 -o ${usrobj} ${usrsrc}"
 	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
 
 	rm -f ${usrobj}
 	[ ! -f "${usrobj}" ] || fatal "Can't delete stale ${usrobj}"
 
 	echo ""
-	echo "Running: ${GCC} ${build_cmd}"
+	echo "Running: ${build_cmd}"
 	echo ""
-	${GCC} ${build_cmd}
+	${build_cmd}
 	[ -f "${usrobj}" ] || fatal "Object not compiled: ${usrobj}"
 
 	echo "Compiled successfully: ${usrobj}"
@@ -103,13 +105,39 @@ function build_xdpsock_app()
 function build_xdpsock_bpf()
 {
 	local bpfsrc="xdpsock_kern.c"
+	local bpfint="xdpsock_kern.ll"
 	local bpfobj="xdpsock_kern.bpf"
-}
+	local libbpf_headers="${XDPTOOLS_PATH}/lib/libbpf/src/root/usr/include"
+
+	# Build xdpsock kernel app via clang
+	local build1_cmd="${CLANG} -I. -I${libbpf_headers} -D__KERNEL__ -D__BPF_TRACING__ -Wall -g -O2"
+	build1_cmd="${build1_cmd} -target bpf -S -emit-llvm ${bpfsrc} -o ${bpfint}"
+	local build2_cmd="${LLC} -march=bpf -filetype=obj ${bpfint} -o ${bpfobj}"
+
+	rm -f ${bpfint} ${bpfobj}
+	[ ! -f "${bpfint}" ] || fatal "Can't delete stale intermediate file ${bpfint}"
+	[ ! -f "${bpfobj}" ] || fatal "Can't delete stale object file ${bpfobj}"
+
+	echo ""
+	echo "Running: ${build1_cmd}"
+	echo ""
+	${build1_cmd}
+	[ -f "${bpfint}" ] || fatal "Intermediate not compiled: ${bpfint}"
+
+	echo ""
+	echo "Running: ${build2_cmd}"
+	echo ""
+	${build2_cmd}
+	[ -f "${bpfobj}" ] || fatal "BPF object not compiled: ${bpfobj}"
+
+	echo "Compiled successfully: ${bpfobj}"
+	echo ""
+ }
 
 while (( "$#" )); do
 	case "${1}" in
-		--prepare)
-			PREPARE=1
+		--nodeps)
+			BUILDDEPS=
 			shift
 			;;
 		--check)
@@ -118,10 +146,12 @@ while (( "$#" )); do
 			;;
 		--cleanup)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
+			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
 			exit 0
 			;;
 		--clean)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
+			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
 			shift
 			;;
 		*)
@@ -135,7 +165,7 @@ done
 #
 
 check_headers
-[ -z ${PREPARE} ] || git_submodule_prep
-[ -z ${PREPARE} ] || build_xdptools
+[ -z "${BUILDDEPS}" ] || git_submodule_prep
+[ -z "${BUILDDEPS}" ] || build_xdptools
 build_xdpsock_app
 build_xdpsock_bpf
