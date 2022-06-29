@@ -3,15 +3,46 @@
 PWD="$(pwd)"
 GIT="$(which git)"
 MAKE="$(which gmake)"
+GCC="$(which gcc)"
+
+PREPARE=
 
 XDPTOOLS_PATH="${PWD}/xdp-tools"
 XDPTOOLS_CONFIGURE="${XDPTOOLS_PATH}/configure"
 XDPTOOLS_CONFIG_MK="config.mk"
 
+function features_needed()
+{
+	echo "We need the following packages to build on Red Hat:"
+	echo "  libcap libcap-devel"
+	echo "	libz libz-devel"
+	echo "	libelf libelf-devel"
+}
+
 function fatal()
 {
 	echo "FATAL ERROR: $@"
 	exit 1
+}
+
+# Check we have all the headers we need
+function check_headers()
+{
+	echo "Checking headers..."
+
+	local usr_includes="sys/capability.h pthread.h"
+	for f in ${usr_includes}; do
+		local fatal=0
+		f="/usr/include/${f}"
+
+		echo " Checking: ${f}"
+		if [ ! -f "${f}" ]; then
+			features_needed
+			fatal "Cannot find: ${f}"
+		fi
+	done
+
+	echo "Got all headers."
 }
 
 # Prepare git submodules and validate they exist
@@ -41,8 +72,50 @@ function build_xdptools()
 	${MAKE} -C ${XDPTOOLS_PATH} V=0
 }
 
+# Build xdpsock user-space application
+function build_xdpsock_app()
+{
+	local usrsrc="xdpsock_user.c"
+	local usrobj="xdpsock_user"
+	local libbpf_static="${XDPTOOLS_PATH}/lib/libbpf/src/libbpf.a"
+	local libbpf_headers="${XDPTOOLS_PATH}/lib/libbpf/src/root/usr/include"
+	local libxdp_static="${XDPTOOLS_PATH}/lib/libxdp/libxdp.a"
+	local libxdp_headers="${XDPTOOLS_PATH}/lib/libxdp"
+
+	# Build xdpsock user app
+	local build_cmd="-I. -I${libxdp_headers} -I${libbpf_headers} -o ${usrobj} ${usrsrc}"
+	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
+
+	rm -f ${usrobj}
+	[ ! -f "${usrobj}" ] || fatal "Can't delete stale ${usrobj}"
+
+	echo ""
+	echo "Running: ${GCC} ${build_cmd}"
+	echo ""
+	${GCC} ${build_cmd}
+	[ -f "${usrobj}" ] || fatal "Object not compiled: ${usrobj}"
+
+	echo "Compiled successfully: ${usrobj}"
+	echo ""
+}
+
+# Build xdpsock bpf object
+function build_xdpsock_bpf()
+{
+	local bpfsrc="xdpsock_kern.c"
+	local bpfobj="xdpsock_kern.bpf"
+}
+
 while (( "$#" )); do
 	case "${1}" in
+		--prepare)
+			PREPARE=1
+			shift
+			;;
+		--check)
+			check_headers
+			exit 0
+			;;
 		--cleanup)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
 			exit 0
@@ -61,5 +134,8 @@ done
 # Default action below here
 #
 
-git_submodule_prep
-build_xdptools
+check_headers
+[ -z ${PREPARE} ] || git_submodule_prep
+[ -z ${PREPARE} ] || build_xdptools
+build_xdpsock_app
+build_xdpsock_bpf
