@@ -58,7 +58,7 @@ static const char *xdpsock_krnl = "xdpsock_kern.bpf";
  * fit the THG changes for kernel validation. However, if you prefer to build
  * with "original bits" anyway, define this. You may get compiler warnings.
  */
-#define USE_ORIGINAL
+#undef USE_ORIGINAL
 
 /************** end of THG bits ***************/
 
@@ -1660,7 +1660,7 @@ static void rx_drop_all(void)
 
 			ret = poll(fds, num_socks, opt_timeout);
 			if (ret <= 0)
-#ifndef USE_ORIGINAL
+#ifdef USE_ORIGINAL
 				continue;
 #else
 			{
@@ -1801,7 +1801,15 @@ static void tx_only_all(void)
 				xsks[i]->app_stats.opt_polls++;
 			ret = poll(fds, num_socks, opt_timeout);
 			if (ret <= 0)
+#ifdef USE_ORIGINAL
 				continue;
+#else
+			{
+				if (benchmark_done)
+					break;
+				continue;
+			}
+#endif
 
 			if (!(fds[0].revents & POLLOUT))
 				continue;
@@ -1921,7 +1929,15 @@ static void l2fwd_all(void)
 			}
 			ret = poll(fds, num_socks, opt_timeout);
 			if (ret <= 0)
+#ifdef USE_ORIGINAL
 				continue;
+#else
+			{
+				if (benchmark_done)
+					break;
+				continue;
+			}
+#endif /* USE_ORIGINAL */
 		}
 
 		for (i = 0; i < num_socks; i++)
