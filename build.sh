@@ -14,6 +14,7 @@ XDPTOOLS_CONFIG_MK="config.mk"
 
 BUILDDEPS=1
 MAX_SOCKS=2
+DEBUG=
 TARGZ=
 
 function features_needed()
@@ -94,7 +95,7 @@ function build_xdpsock_app()
 	# Build xdpsock user app
 	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers}"
 	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${FCQ_DEFINE}"
-	build_cmd="${build_cmd} -DXDPSOCK_KRNL=\"${krnlobj}\""
+	build_cmd="${build_cmd} -DXDPSOCK_KRNL=\"${krnlobj}\" ${DEBUG}"
 	build_cmd="${build_cmd} -o ${usrobj} ${usrsrc}"
 	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
 
@@ -124,7 +125,7 @@ function build_xdpsock_bpf()
 
 	# Build xdpsock kernel app via clang
 	local build1_cmd="${CLANG} -I. -I${libbpf_headers} -D__KERNEL__ -D__BPF_TRACING__"
-	build1_cmd="${build1_cmd} -DMAX_SOCKS=${MAX_SOCKS} ${FCQ_DEFINE} -Wall -g -O2"
+	build1_cmd="${build1_cmd} -DMAX_SOCKS=${MAX_SOCKS} ${FCQ_DEFINE} ${DEBUG} -Wall -g -O2"
 	build1_cmd="${build1_cmd} -target bpf -S -emit-llvm ${bpfsrc} -o ${bpfint}"
 	local build2_cmd="${LLC} -march=bpf -filetype=obj ${bpfint} -o ${bpfobj}"
 
@@ -192,6 +193,10 @@ while (( "$#" )); do
 			[ $# -ge 2 ] || fatal "Insufficient args: --max-xsk <num>"
 			MAX_SOCKS="${2}"
 			shift
+			shift
+			;;
+		--debug)
+			DEBUG="-DUSE_DEBUGMODE=1"
 			shift
 			;;
 		--tar)

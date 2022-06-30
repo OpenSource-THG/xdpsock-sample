@@ -499,6 +499,9 @@ static void dump_stats(void)
 	prev_time = now;
 
 	fprintf(stdout, "----------------------------------------------------------------------\n");
+#ifdef USE_DEBUGMODE
+	fprintf(stdout, " *** WARNING - Debugmode is enabled - performance may not be good ***\n");
+#endif
 
 	for (i = 0; i < num_socks && xsks[i]; i++) {
 		char *fmt = "%-18s %'-14.0f %'-14lu\n";
@@ -1275,7 +1278,7 @@ static void usage(const char *prog)
 		"  -I, --irq-string	Display driver interrupt statistics for interface associated with irq-string.\n"
 		"  -B, --busy-poll      Busy poll.\n"
 		"  -R, --reduce-cap	Use reduced capabilities (cannot be used with -M)\n"
-		"\nMAX_SOCKS:%d MULTI_FCQ:%s KRNL:%s\n"
+		"\nMAX_SOCKS:%d MULTI_FCQ:%s KRNL:%s DEBUGMODE:%s\n"
 		"\n";
 	fprintf(stderr, str, prog, XSK_UMEM__DEFAULT_FRAME_SIZE,
 		opt_batch_size, MIN_PKT_SIZE, MIN_PKT_SIZE,
@@ -1284,6 +1287,11 @@ static void usage(const char *prog)
 		SCHED_PRI__DEFAULT,
 		MAX_SOCKS,
 #ifdef MULTI_FCQ
+		"Yes",
+#else
+		"No",
+#endif
+#ifdef USE_DEBUGMODE
 		"Yes",
 #else
 		"No",
@@ -2009,14 +2017,20 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 		int fd = xsk_socket__fd(xsks[i]->xsk);
 		int key, ret;
 
+#ifdef MULTI_FCQ
+		/* In a multi-FCQ setup, we need to insert with key=channel */
+		key = xsks[i]->channel_id;
+#else
+		/* In a single-FCQ setup, we need to insert with key=xsk_index */
 		key = xsks[i]->xsk_index;
+#endif
 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
 		if (ret) {
 			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
 			exit(EXIT_FAILURE);
 		}
 
-		fprintf(stdout, "Inserted XSK[%u] fd:%d into xsks_map[%u]\n", xsks[i]->xsk_index, fd, xsks[i]->xsk_index);
+		fprintf(stdout, "Inserted XSK[%u] fd:%d into xsks_map[key=%u]\n", xsks[i]->xsk_index, fd, key);
 	}
 }
 

@@ -16,12 +16,16 @@
 #define QTYPE "SINGLE"
 #endif
 
+#ifdef USE_DEBUGMODE
 #define odbpf_vdebug(fmt, args...)                                                       \
 	({                                                                                   \
 		char ____fmt[] = fmt;                                                            \
 		bpf_trace_printk(____fmt, sizeof(____fmt), ##args);                              \
 	})
 #define odbpf_debug(fmt, args...) odbpf_vdebug(fmt, ##args)
+#else
+#define odbpf_debug(fmt, args...)
+#endif /* USE_DEBUGMODE */
 
 /* This XDP program is only needed for the XDP_SHARED_UMEM mode.
  * If you do not use this mode, libbpf can supply an XDP program for you.
