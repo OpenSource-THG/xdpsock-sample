@@ -136,6 +136,19 @@ static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
 
+/* Declare the bpf kernel name we will try to load. */
+#ifdef XDPSOCK_KRNL
+static const char *xdpsock_krnl = XDPSOCK_KRNL;
+#else
+static const char *xdpsock_krnl = "xdpsock_kern.bpf";
+#endif
+
+/* Some bits of this code are modified from the original in order to better
+ * fit the THG changes for kernel validation. However, if you prefer to build
+ * with "original bits" anyway, define this. You may get compiler warnings.
+ */
+#undef USE_ORIGINAL
+
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
 	unsigned char h_source[6];
@@ -199,6 +212,10 @@ struct xsk_umem_info {
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
+#ifdef MULTI_FCQ
+	struct xsk_ring_prod fq;
+	struct xsk_ring_cons cq;
+#endif /* MULTI_FCQ */
 	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
 	struct xsk_ring_stats ring_stats;
@@ -1139,12 +1156,21 @@ static void usage(const char *prog)
 		"  -I, --irq-string	Display driver interrupt statistics for interface associated with irq-string.\n"
 		"  -B, --busy-poll      Busy poll.\n"
 		"  -R, --reduce-cap	Use reduced capabilities (cannot be used with -M)\n"
+		"\nMAX_SOCKS:%d MULTI_FCQ:%s KRNL:%s\n"
 		"\n";
 	fprintf(stderr, str, prog, XSK_UMEM__DEFAULT_FRAME_SIZE,
 		opt_batch_size, MIN_PKT_SIZE, MIN_PKT_SIZE,
 		XSK_UMEM__DEFAULT_FRAME_SIZE, opt_pkt_fill_pattern,
 		VLAN_VID__DEFAULT, VLAN_PRI__DEFAULT,
-		SCHED_PRI__DEFAULT);
+		SCHED_PRI__DEFAULT,
+		MAX_SOCKS,
+#ifdef MULTI_FCQ
+		"Yes",
+#else
+		"No",
+#endif
+		xdpsock_krnl
+		);
 
 	exit(EXIT_FAILURE);
 }
@@ -1747,14 +1773,18 @@ static void l2fwd_all(void)
 
 static void load_xdp_program(char **argv, struct bpf_object **obj)
 {
+	int prog_fd;
 	struct bpf_prog_load_attr prog_load_attr = {
 		.prog_type      = BPF_PROG_TYPE_XDP,
 	};
-	char xdp_filename[256];
-	int prog_fd;
 
+#ifdef USE_ORIGINAL
+	char xdp_filename[256];
 	snprintf(xdp_filename, sizeof(xdp_filename), "%s_kern.o", argv[0]);
 	prog_load_attr.file = xdp_filename;
+#else
+	prog_load_attr.file = xdpsock_krnl;
+#endif /* USE_ORIGINAL */
 
 	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
 		exit(EXIT_FAILURE);
@@ -1928,19 +1958,32 @@ int main(int argc, char **argv)
 	}
 
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
+#ifdef MULTI_FCQ
+	bufs = mmap(NULL, (NUM_FRAMES * opt_xsk_frame_size) * MAX_SOCKS,
+		    PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
+#else
 	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
 		    PROT_READ | PROT_WRITE,
 		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
+#endif /* MULTI_FCQ */
 	if (bufs == MAP_FAILED) {
 		printf("ERROR: mmap failed\n");
 		exit(EXIT_FAILURE);
 	}
 
 	/* Create sockets... */
+#ifdef MULTI_FCQ
+	umem = xsk_configure_umem(bufs, (NUM_FRAMES * opt_xsk_frame_size) * MAX_SOCKS);
+#else
 	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
+#endif
 	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
 		rx = true;
+#ifndef MULTI_FCQ
+		/* In a multi-fcq setup we don't fill yet, because we need to create the xsk sockets */
 		xsk_populate_fill_ring(umem);
+#endif
 	}
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;

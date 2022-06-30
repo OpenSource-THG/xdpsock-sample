@@ -15,6 +15,7 @@ XDPTOOLS_CONFIG_MK="config.mk"
 
 MAX_SOCKS=2
 MULTI_FCQ=""
+XDPSOCK_KRNL="xdpsock_kern.bpf"
 
 function features_needed()
 {
@@ -89,7 +90,7 @@ function build_xdpsock_app()
 
 	# Build xdpsock user app
 	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers}"
-	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${MULTI_FCQ}"
+	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${MULTI_FCQ} -DXDPSOCK_KRNL=\"${XDPSOCK_KRNL}\""
 	build_cmd="${build_cmd} -o ${usrobj} ${usrsrc}"
 	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
 
@@ -168,6 +169,12 @@ while (( "$#" )); do
 			;;
 		--multi-fcq)
 			MULTI_FCQ="-DMULTI_FCQ=1"
+			shift
+			;;
+		--bpf-object)
+			[ $# -ge 2 ] || fatal "Insufficient args: --bpf-object <object_filename>"
+			XDPSOCK_KRNL="${2}"
+			shift
 			shift
 			;;
 		*)
