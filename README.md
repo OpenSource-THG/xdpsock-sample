@@ -223,4 +223,10 @@ Tar created: xdpsock.tar.gz
 
 [ajm@rocky8dev xdpsock-sample]$ ls -l xdpsock.tar.gz
 -rw-rw-r-- 1 ajm ajm 1397942 Jun 30 22:23 xdpsock.tar.gz
+
+[ajm@rocky8dev xdpsock-sample]$ ./xdpsock_single -h 2>&1 | grep MAX_SOCKS
+MAX_SOCKS:8 MULTI_FCQ:No KRNL:xdpsock_single.bpf DEBUGMODE:No
+
+[ajm@rocky8dev xdpsock-sample]$ ./xdpsock_multi -h 2>&1 | grep MAX_SOCKS
+MAX_SOCKS:8 MULTI_FCQ:Yes KRNL:xdpsock_multi.bpf DEBUGMODE:No
 ```
