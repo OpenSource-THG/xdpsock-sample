@@ -1291,12 +1291,12 @@ static void usage(const char *prog)
 #else
 		"No",
 #endif
+		xdpsock_krnl,
 #ifdef USE_DEBUGMODE
-		"Yes",
+		"Yes"
 #else
-		"No",
+		"No"
 #endif
-		xdpsock_krnl
 		);
 
 	exit(EXIT_FAILURE);
