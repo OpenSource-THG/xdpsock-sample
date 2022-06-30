@@ -217,12 +217,14 @@ struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
 
+	u32 channel_id; /**< Channel ID of this xsk */
+	u32 xsk_index; /**< Index of this xsk within xsks */
+	
 #ifdef MULTI_FCQ
 
 	struct xsk_ring_prod fq; /**< Dedicated fill queue */
 	struct xsk_ring_cons cq; /**< Dedicated comp queue */
 	u64 umem_offset; /**< Umem offset of descriptors for this XSK */
-	u32 xsks_idx; /**< Index of this xsk within xsks */
 
 #endif /* MULTI_FCQ */
 
@@ -1033,7 +1035,7 @@ static void xsk_populate_fill_ring_xsk(struct xsk_umem_info *umem, struct xsk_so
 	 * basis. */
 
 	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu\n",
-		xsk->xsks_idx, xsk->umem_offset);
+		xsk->xsk_index, xsk->umem_offset);
 
 	ret = xsk_ring_prod__reserve(&xsk->fq,
 				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
@@ -1067,8 +1069,6 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 
 #endif /* MULTI_FCQ */
 
-#ifdef MULTI_FCQ
-
 /* Original xsk_configure_socket() always binds to the same Channel ID, which is not multi-core.
  *
  * Revised API includes an xsk_index, so we can apply this as an offset from Channel ID,
@@ -1077,11 +1077,6 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
  */
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 						    bool rx, bool tx, int xsk_index)
-
-#else
-static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
-						    bool rx, bool tx)
-#endif /* MULTI_FCQ */
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -1097,21 +1092,28 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 
-#ifdef MULTI_FCQ
-	/* We don't want to use dispatcher - we always want to load our kernel. */
-	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
-#else
+#ifdef USE_ORIGINAL
+
 	if (opt_num_xsks > 1 || opt_reduced_cap)
 		cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	else
 		cfg.libbpf_flags = 0;
-#endif /* MULTI_FCQ */
+
+#else
+
+	/* We don't want to use dispatcher - we always want to load our kernel. */
+	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+
+#endif /* USE_ORIGINAL */
 
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags;
 
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
+
+	/* Save our position in xsks array and map. */
+	xsk->xsk_index = xsk_index;
 
 #ifdef MULTI_FCQ
 
@@ -1120,25 +1122,31 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	 *
 	 * Logic here is xsk[0] gets the first batch of descriptors, xsk[1] gets the next batch,
 	 * and so on. */
-	xsk->xsks_idx = xsk_index;
+
 	xsk->umem_offset = xsk_index * (NUM_FRAMES * opt_xsk_frame_size);
 
 	/* In a multi-FCQ setup, we bind to multiple channel IDs, so we calculate this via the
 	 * queue number + the xsk index. Mellanox cards will need to have --queue=n for zero copy. */
-	unsigned int channel_id = opt_queue + xsk_index;
+
+	xsk->channel_id = opt_queue + xsk_index;
 
 	/* In a multi-FCQ setup we use the xsk_socket__create_shared() API which lets us pass
 	 * in pointers to dedicated Fill/Completion queue per XSK. */
 
-	 fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n",
-	 	xsk_index, opt_if, channel_id);
-	 ret = xsk_socket__create_shared(&xsk->xsk, opt_if, channel_id, umem->umem,
+	fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n",
+		xsk->xsk_index, opt_if, xsk->channel_id);
+	ret = xsk_socket__create_shared(&xsk->xsk, opt_if, xsk->channel_id, umem->umem,
 	 			rxr, txr, &xsk->fq, &xsk->cq, &cfg);
 
 #else /* MULTI_FCQ */
+
+	/* In a single-FCQ setup we stick to the original design of xdpsock_user.c, and so our channel
+	 * ID will only ever be a single queue. */
+
+	xsk->channel_id = opt_queue;
 	
-	fprintf(stdout, "Opening single-FCQ XSK to %s channel %u...\n",
-		opt_if, opt_queue);
+	fprintf(stdout, "Opening single-FCQ XSK[%u] to %s channel %u...\n",
+		xsk->xsk_index, opt_if, opt_queue);
 	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
 				 rxr, txr, &cfg);
 
@@ -1957,6 +1965,8 @@ static void load_xdp_program(char **argv, struct bpf_object **obj)
 
 	prog_load_attr.file = xdpsock_krnl;
 
+	fprintf(stdout, "Our XDP kernel is: %s\n", prog_load_attr.file);
+
 	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
 		exit(EXIT_FAILURE);
 	if (prog_fd < 0) {
@@ -1988,10 +1998,10 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 
 	for (i = 0; i < num_socks; i++) {
 #ifdef MUTLI_FCQ
-		if (i != xsks[i]->xsks_idx);
+		if (i != xsks[i]->xsk_index);
 		{
-			fprintf(stderr, "ERROR: xsk with invalid xsks_id at index (xsks_idx:%u, i:%d)\n",
-				xsks[i]->xsks_id, i);
+			fprintf(stderr, "ERROR: xsk with invalid xsk_index at index (xsk_index:%u, i:%d)\n",
+				xsks[i]->xsk_index, i);
 			exit(EXIT_FAILURE);
 		}
 #endif
@@ -1999,14 +2009,14 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 		int fd = xsk_socket__fd(xsks[i]->xsk);
 		int key, ret;
 
-		key = i;
+		key = xsks[i]->xsk_index;
 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
 		if (ret) {
 			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
 			exit(EXIT_FAILURE);
 		}
 
-		fprintf(stdout, "Inserted XSK[%d] fd:%d into xsks_map\n", i, fd);
+		fprintf(stdout, "Inserted XSK[%u] fd:%d into xsks_map[%u]\n", xsks[i]->xsk_index, fd, xsks[i]->xsk_index);
 	}
 }
 
@@ -2137,8 +2147,7 @@ int main(int argc, char **argv)
 		/* Use libbpf 1.0 API mode */
 		libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
-#ifndef MULTI_FCQ
-		/* Only check this if we're in single-FCQ mode. */
+#ifdef USE_ORIGINAL
 		if (opt_num_xsks > 1)
 #endif
 			load_xdp_program(argv, &obj);
@@ -2185,11 +2194,7 @@ int main(int argc, char **argv)
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;
 	for (i = 0; i < opt_num_xsks; i++)
-#ifdef MULTI_FCQ
 		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx, i);
-#else
-		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
-#endif
 
 #ifdef MULTI_FCQ
 	/* In a multi-fcq setup we fill via each XSK FQ. */
@@ -2210,11 +2215,11 @@ int main(int argc, char **argv)
 			gen_eth_frame(umem, i * opt_xsk_frame_size);
 	}
 
-#ifdef MULTI_FCQ
+#ifdef USE_ORIGINAL
+	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
+#else
 	/* We need to insert our XSK irrespective of whether we have 1 channel or not */
 	if (opt_bench != BENCH_TXONLY)
-#else
-	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
 #endif
 		enter_xsks_into_map(obj);
 
