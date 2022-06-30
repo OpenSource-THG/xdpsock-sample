@@ -8,6 +8,14 @@
 #include <bpf/bpf_helpers.h>
 #include "xdpsock.h"
 
+#include <netinet/if_ether.h>
+
+#ifdef MULTI_FCQ
+#define QTYPE "MULTI"
+#else
+#define QTYPE "SINGLE"
+#endif
+
 #define odbpf_vdebug(fmt, args...)                                                       \
 	({                                                                                   \
 		char ____fmt[] = fmt;                                                            \
@@ -30,26 +38,32 @@ static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
-#ifdef MULTI_FCQ
+	struct ethhdr *eth = (struct ethhdr *)(unsigned long)(ctx->data);
+	void *data_end = (void *)(unsigned long)(ctx->data_end);
 
+	if ((void *)eth + sizeof(struct ethhdr) > data_end)
+		return XDP_ABORTED;
+
+	/* Pass ARP so tests don't start failing due to switch issues. Note htons(arp) == 1544. */
+	if (eth->h_proto == 1544)
+		return XDP_PASS;
+	
+#ifdef MULTI_FCQ
 	/* In a multi-FCQ setup we lookup the rx channel ID in our xsk map */
 	rr = ctx->rx_queue_index;
+#else
+	/* In a single-FCQ setup we roundrobin between sockets. */
+	rr = (rr + 1) & (MAX_SOCKS - 1);
+#endif
+
 	if (bpf_map_lookup_elem(&xsks_map, &rr))
 	{
-		odbpf_debug("[MultiFCQ] Redirecting to rr=%u", rr);
+		odbpf_debug("[%s] Redirecting to rr=%u", QTYPE, rr);
 		return bpf_redirect_map(&xsks_map, rr, 0);
 	}
 
-	odbpf_debug("MultiFCQ] Lookup failed on rr=%u", rr);
+	odbpf_debug("[%s] Lookup failed on rr=%u", QTYPE, rr);
 	return XDP_DROP;
-
-#else
-
-	rr = (rr + 1) & (MAX_SOCKS - 1);
-	odbpf_debug("[SingleFCQ] Redirecting to rr=%u", rr);
-	return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
-
-#endif
 }
 
 char _license[] SEC("license") = "Dual BSD/GPL";
