@@ -13,6 +13,9 @@ XDPTOOLS_PATH="${PWD}/xdp-tools"
 XDPTOOLS_CONFIGURE="${XDPTOOLS_PATH}/configure"
 XDPTOOLS_CONFIG_MK="config.mk"
 
+MAX_SOCKS=2
+MULTI_FCQ=""
+
 function features_needed()
 {
 	echo "We need the following packages to build on Red Hat:"
@@ -85,7 +88,9 @@ function build_xdpsock_app()
 	local libxdp_headers="${XDPTOOLS_PATH}/lib/libxdp"
 
 	# Build xdpsock user app
-	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers} -Wall -g -O2 -o ${usrobj} ${usrsrc}"
+	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers}"
+	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${MULTI_FCQ}"
+	build_cmd="${build_cmd} -o ${usrobj} ${usrsrc}"
 	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
 
 	rm -f ${usrobj}
@@ -110,7 +115,8 @@ function build_xdpsock_bpf()
 	local libbpf_headers="${XDPTOOLS_PATH}/lib/libbpf/src/root/usr/include"
 
 	# Build xdpsock kernel app via clang
-	local build1_cmd="${CLANG} -I. -I${libbpf_headers} -D__KERNEL__ -D__BPF_TRACING__ -Wall -g -O2"
+	local build1_cmd="${CLANG} -I. -I${libbpf_headers} -D__KERNEL__ -D__BPF_TRACING__"
+	build1_cmd="${build1_cmd} -DMAX_SOCKS=${MAX_SOCKS} -Wall -g -O2"
 	build1_cmd="${build1_cmd} -target bpf -S -emit-llvm ${bpfsrc} -o ${bpfint}"
 	local build2_cmd="${LLC} -march=bpf -filetype=obj ${bpfint} -o ${bpfobj}"
 
@@ -152,6 +158,16 @@ while (( "$#" )); do
 		--clean)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
 			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
+			shift
+			;;
+		--channels)
+			[ $# -ge 2 ] || fatal "Insufficient args: --channels <num>"
+			MAX_SOCKS="${2}"
+			shift
+			shift
+			;;
+		--multi-fcq)
+			MULTI_FCQ="-DMULTI_FCQ=1"
 			shift
 			;;
 		*)

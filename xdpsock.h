@@ -11,7 +11,10 @@
 #ifndef XDPSOCK_H_
 #define XDPSOCK_H_
 
-#define MAX_SOCKS 4
+#ifndef MAX_SOCKS
+#warning MAX_SOCKS is undefined - defaulting to 2
+#define MAX_SOCKS 2
+#endif
 
 #define SOCKET_NAME "sock_cal_bpf_fd"
 #define MAX_NUM_OF_CLIENTS 10
