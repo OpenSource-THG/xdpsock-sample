@@ -6,15 +6,16 @@ MAKE="$(which gmake)"
 GCC="$(which gcc)"
 CLANG="$(which clang)"
 LLC="$(which llc)"
-
-BUILDDEPS=1
+TAR="$(which tar)"
 
 XDPTOOLS_PATH="${PWD}/xdp-tools"
 XDPTOOLS_CONFIGURE="${XDPTOOLS_PATH}/configure"
 XDPTOOLS_CONFIG_MK="config.mk"
 
+BUILDDEPS=1
 MAX_SOCKS=2
-MULTI_FCQ=""
+MULTI_FCQ=
+TARGZ=
 XDPSOCK_KRNL="xdpsock_kern.bpf"
 
 function features_needed()
@@ -139,7 +140,27 @@ function build_xdpsock_bpf()
 
 	echo "Compiled successfully: ${bpfobj}"
 	echo ""
- }
+}
+
+# Tar up binary files
+function tar_xdpsock()
+{
+	local files="xdpsock_user ${XDPSOCK_KRNL}"
+	local tar="xdpsock.tar.gz"
+
+	rm -f "${tar}"
+	[ ! -f "${tar}" ] || fatal "Can't delete stale tar: ${tar}"
+
+	echo ""
+	echo "Creating ${tar} from: ${files}"
+	echo ""
+	${TAR} -zcvf ${tar} ${files}
+	[ -f "${tar}" ] || fatal "Tar file not created: ${tar}"
+
+	echo ""
+	echo "Tar created: ${tar}"
+	echo ""
+}
 
 while (( "$#" )); do
 	case "${1}" in
@@ -161,8 +182,8 @@ while (( "$#" )); do
 			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
 			shift
 			;;
-		--channels)
-			[ $# -ge 2 ] || fatal "Insufficient args: --channels <num>"
+		--max-xsk)
+			[ $# -ge 2 ] || fatal "Insufficient args: --max-xsk <num>"
 			MAX_SOCKS="${2}"
 			shift
 			shift
@@ -175,6 +196,10 @@ while (( "$#" )); do
 			[ $# -ge 2 ] || fatal "Insufficient args: --bpf-object <object_filename>"
 			XDPSOCK_KRNL="${2}"
 			shift
+			shift
+			;;
+		--tar)
+			TARGZ=1
 			shift
 			;;
 		*)
@@ -192,3 +217,4 @@ check_headers
 [ -z "${BUILDDEPS}" ] || build_xdptools
 build_xdpsock_app
 build_xdpsock_bpf
+[ -z "${TARGZ}" ] || tar_xdpsock

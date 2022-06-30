@@ -45,6 +45,23 @@
 /* libbpf APIs for AF_XDP are deprecated starting from v0.7 */
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
+/***************** THG bits ******************/
+
+/* Declare the bpf kernel name we will try to load. */
+#ifdef XDPSOCK_KRNL
+static const char *xdpsock_krnl = XDPSOCK_KRNL;
+#else
+static const char *xdpsock_krnl = "xdpsock_kern.bpf";
+#endif
+
+/* Some bits of this code are modified from the original in order to better
+ * fit the THG changes for kernel validation. However, if you prefer to build
+ * with "original bits" anyway, define this. You may get compiler warnings.
+ */
+#define USE_ORIGINAL
+
+/************** end of THG bits ***************/
+
 #ifndef SOL_XDP
 #define SOL_XDP 283
 #endif
@@ -136,19 +153,6 @@ static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
 
-/* Declare the bpf kernel name we will try to load. */
-#ifdef XDPSOCK_KRNL
-static const char *xdpsock_krnl = XDPSOCK_KRNL;
-#else
-static const char *xdpsock_krnl = "xdpsock_kern.bpf";
-#endif
-
-/* Some bits of this code are modified from the original in order to better
- * fit the THG changes for kernel validation. However, if you prefer to build
- * with "original bits" anyway, define this. You may get compiler warnings.
- */
-#undef USE_ORIGINAL
-
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
 	unsigned char h_source[6];
@@ -212,10 +216,16 @@ struct xsk_umem_info {
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
+
 #ifdef MULTI_FCQ
-	struct xsk_ring_prod fq;
-	struct xsk_ring_cons cq;
+
+	struct xsk_ring_prod fq; /**< Dedicated fill queue */
+	struct xsk_ring_cons cq; /**< Dedicated comp queue */
+	u64 umem_offset; /**< Umem offset of descriptors for this XSK */
+	u32 xsks_idx; /**< Index of this xsk within xsks */
+
 #endif /* MULTI_FCQ */
+
 	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
 	struct xsk_ring_stats ring_stats;
@@ -244,7 +254,7 @@ static const struct sched_map {
 	{ NULL }
 };
 
-static int num_socks;
+static int num_socks = 0;
 struct xsk_socket_info *xsks[MAX_SOCKS];
 int sock;
 
@@ -638,7 +648,10 @@ static void xdpsock_cleanup(void)
 			exit_with_error(errno);
 	}
 
+#ifndef MULTI_FCQ
+	/* Only check this if we're in single-FCQ mode. */
 	if (opt_num_xsks > 1)
+#endif
 		remove_xdp_program();
 }
 
@@ -1003,6 +1016,37 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 	return umem;
 }
 
+#ifdef MULTI_FCQ
+
+/* This is the multi-FCQ fill routine called after each XSK socket is created, and
+ * feeds the XSK FQ with descriptors dedicated for that XSK. */
+
+static void xsk_populate_fill_ring_xsk(struct xsk_umem_info *umem, struct xsk_socket_info *xsk)
+{
+	int ret, i;
+	u32 idx;
+
+	/* In a multi-FCQ setup, umem size is multiplied by the number of XSK sockets we have. That
+	 * means our umem offset for each descriptor is not uniform - and is different on a per-FQ/CQ
+	 * basis. */
+
+	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu", xsk->xsks_idx, xsk->umem_offset);
+
+	ret = xsk_ring_prod__reserve(&xsk->fq,
+				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
+	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS * 2)
+		exit_with_error(-ret);
+	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS * 2; i++)
+		*xsk_ring_prod__fill_addr(&xsk->fq, idx++) =
+			xsk->umem_offset + (i * opt_xsk_frame_size);
+	xsk_ring_prod__submit(&xsk->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
+}
+
+#else
+
+/* This is the single-FCQ fill routine called after UMEM is created, but before
+ * any XSK socket is created. */
+
 static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 {
 	int ret, i;
@@ -1018,8 +1062,23 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
 	xsk_ring_prod__submit(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
 }
 
+#endif /* MULTI_FCQ */
+
+#ifdef MULTI_FCQ
+
+/* Original xsk_configure_socket() always binds to the same Channel ID, which is not multi-core.
+ *
+ * Revised API includes an xsk_index, so we can apply this as an offset from Channel ID,
+ * allowing us to bind one XSK socket to each Channel. This also means we can support zero
+ * copy queue offset via --queue=n, n being the offset.
+ */
+static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
+						    bool rx, bool tx, int xsk_index)
+
+#else
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 						    bool rx, bool tx)
+#endif /* MULTI_FCQ */
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -1034,17 +1093,52 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	xsk->umem = umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+
+#ifdef MULTI_FCQ
+	/* We don't want to use dispatcher - we always want to load our kernel. */
+	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+#else
 	if (opt_num_xsks > 1 || opt_reduced_cap)
 		cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	else
 		cfg.libbpf_flags = 0;
+#endif /* MULTI_FCQ */
+
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags;
 
 	rxr = rx ? &xsk->rx : NULL;
 	txr = tx ? &xsk->tx : NULL;
+
+#ifdef MULTI_FCQ
+
+	/* In a multi-FCQ setup we need to store a umem offset, telling us where the umem descriptors
+	 * for this XSK are. This is so each channel does not hit the same memory space.
+	 *
+	 * Logic here is xsk[0] gets the first batch of descriptors, xsk[1] gets the next batch,
+	 * and so on. */
+	xsk->xsks_idx = xsk_index;
+	xsk->umem_offset = xsk_index * (NUM_FRAMES * opt_xsk_frame_size);
+
+	/* In a multi-FCQ setup, we bind to multiple channel IDs, so we calculate this via the
+	 * queue number + the xsk index. Mellanox cards will need to have --queue=n for zero copy. */
+	unsigned int channel_id = opt_queue + xsk_index;
+
+	/* In a multi-FCQ setup we use the xsk_socket__create_shared() API which lets us pass
+	 * in pointers to dedicated Fill/Completion queue per XSK. */
+
+	 fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n", xsk_index, opt_if, channel_id);
+	 ret = xsk_socket__create_shared(&xsk->xsk, opt_if, channel_id, umem->umem,
+	 			rxr, txr, &xsk->fq, &xsk->cq, &cfg);
+
+#else /* MULTI_FCQ */
+	
+	fprintf(stdout, "Opening single-FCQ XSK to %s channel %u...\n", opt_if, opt_queue);
 	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
 				 rxr, txr, &cfg);
+
+#endif /* MULTI_FCQ */
+
 	if (ret)
 		exit_with_error(-ret);
 
@@ -1082,7 +1176,11 @@ static struct option long_options[] = {
 	{"frame-size", required_argument, 0, 'f'},
 	{"no-need-wakeup", no_argument, 0, 'm'},
 	{"unaligned", no_argument, 0, 'u'},
+#ifdef MULTI_FCQ
+	{"channels", required_argument, 0, 'M'},
+#else
 	{"shared-umem", no_argument, 0, 'M'},
+#endif
 	{"force", no_argument, 0, 'F'},
 	{"duration", required_argument, 0, 'd'},
 	{"clock", required_argument, 0, 'w'},
@@ -1117,7 +1215,11 @@ static void usage(const char *prog)
 		"  -t, --txonly		Only send packets\n"
 		"  -l, --l2fwd		MAC swap L2 forwarding\n"
 		"  -i, --interface=n	Run on interface n\n"
+#ifdef MULTI_FCQ
+		"  -q, --queue=n	Start at queue n (default 0), this can be used for ZC queue offsets (looking at you mlx...)\n"
+#else
 		"  -q, --queue=n	Use queue n (default 0)\n"
+#endif
 		"  -p, --poll		Use poll syscall\n"
 		"  -S, --xdp-skb=n	Use XDP skb-mod\n"
 		"  -N, --xdp-native=n	Enforce XDP native mode\n"
@@ -1128,7 +1230,11 @@ static void usage(const char *prog)
 		"  -m, --no-need-wakeup Turn off use of driver need wakeup flag.\n"
 		"  -f, --frame-size=n   Set the frame size (must be a power of two in aligned mode, default is %d).\n"
 		"  -u, --unaligned	Enable unaligned chunk placement\n"
+#ifdef MULTI_FCQ
+		"  -M, --channels=n		Open n number of channels. Also enables XDP_SHARED_UMEM (cannot be used with -R).\n"
+#else
 		"  -M, --shared-umem	Enable XDP_SHARED_UMEM (cannot be used with -R)\n"
+#endif
 		"  -F, --force		Force loading the XDP prog\n"
 		"  -d, --duration=n	Duration in secs to run command.\n"
 		"			Default: forever.\n"
@@ -1250,7 +1356,17 @@ static void parse_command_line(int argc, char **argv)
 			opt_xdp_bind_flags &= ~XDP_USE_NEED_WAKEUP;
 			break;
 		case 'M':
+#ifdef MULTI_FCQ
+			opt_num_xsks = atoi(optarg);
+			if (opt_num_xsks == 0 || opt_num_xsks > MAX_SOCKS)
+			{
+				fprintf(stderr, "ERROR: Invalid number of XSK sockets: %d (Min: 1 Max: %d)\n",
+					opt_num_xsks, MAX_SOCKS);
+				usage(basename(argv[0]));
+			}
+#else
 			opt_num_xsks = MAX_SOCKS;
+#endif
 			break;
 		case 'd':
 			opt_duration = atoi(optarg);
@@ -1383,7 +1499,6 @@ static void kick_tx(struct xsk_socket_info *xsk)
 
 static inline void complete_tx_l2fwd(struct xsk_socket_info *xsk)
 {
-	struct xsk_umem_info *umem = xsk->umem;
 	u32 idx_cq = 0, idx_fq = 0;
 	unsigned int rcvd;
 	size_t ndescs;
@@ -1404,30 +1519,39 @@ static inline void complete_tx_l2fwd(struct xsk_socket_info *xsk)
 	ndescs = (xsk->outstanding_tx > opt_batch_size) ? opt_batch_size :
 		xsk->outstanding_tx;
 
+#ifdef MULTI_FCQ
+	struct xsk_ring_prod *fq_ptr = &xsk->fq;
+	struct xsk_ring_cons *cq_ptr = &xsk->cq;
+#else
+	struct xsk_umem_info *umem = xsk->umem;
+	struct xsk_ring_prod *fq_ptr = &umem->fq;
+	struct xsk_ring_cons *cq_ptr = &umem->cq;
+#endif
+
 	/* re-add completed Tx buffers */
-	rcvd = xsk_ring_cons__peek(&umem->cq, ndescs, &idx_cq);
+	rcvd = xsk_ring_cons__peek(cq_ptr, ndescs, &idx_cq);
 	if (rcvd > 0) {
 		unsigned int i;
 		int ret;
 
-		ret = xsk_ring_prod__reserve(&umem->fq, rcvd, &idx_fq);
+		ret = xsk_ring_prod__reserve(fq_ptr, rcvd, &idx_fq);
 		while (ret != rcvd) {
 			if (ret < 0)
 				exit_with_error(-ret);
-			if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&umem->fq)) {
+			if (opt_busy_poll || xsk_ring_prod__needs_wakeup(fq_ptr)) {
 				xsk->app_stats.fill_fail_polls++;
 				recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL,
 					 NULL);
 			}
-			ret = xsk_ring_prod__reserve(&umem->fq, rcvd, &idx_fq);
+			ret = xsk_ring_prod__reserve(fq_ptr, rcvd, &idx_fq);
 		}
 
 		for (i = 0; i < rcvd; i++)
-			*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) =
-				*xsk_ring_cons__comp_addr(&umem->cq, idx_cq++);
+			*xsk_ring_prod__fill_addr(fq_ptr, idx_fq++) =
+				*xsk_ring_cons__comp_addr(cq_ptr, idx_cq++);
 
-		xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
-		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
+		xsk_ring_prod__submit(fq_ptr, rcvd);
+		xsk_ring_cons__release(cq_ptr, rcvd);
 		xsk->outstanding_tx -= rcvd;
 	}
 }
@@ -1446,9 +1570,15 @@ static inline void complete_tx_only(struct xsk_socket_info *xsk,
 		kick_tx(xsk);
 	}
 
-	rcvd = xsk_ring_cons__peek(&xsk->umem->cq, batch_size, &idx);
+#ifdef MULTI_FCQ
+	struct xsk_ring_cons *cq_ptr = &xsk->cq;
+#else
+	struct xsk_ring_cons *cq_ptr = &xsk->umem->cq;
+#endif
+
+	rcvd = xsk_ring_cons__peek(cq_ptr, batch_size, &idx);
 	if (rcvd > 0) {
-		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
+		xsk_ring_cons__release(cq_ptr, rcvd);
 		xsk->outstanding_tx -= rcvd;
 	}
 }
@@ -1459,24 +1589,32 @@ static void rx_drop(struct xsk_socket_info *xsk)
 	u32 idx_rx = 0, idx_fq = 0;
 	int ret;
 
+#ifdef MULTI_FCQ
+	/* In a multi-FCQ setup, we take the XSK's dedicated fill queue */
+	struct xsk_ring_prod *fq_ptr = &xsk->fq;
+#else
+	/* Otherwise we take the single umem fill queue */
+	struct xsk_ring_prod *fq_ptr = &xsk->umem->fq;
+#endif
+
 	rcvd = xsk_ring_cons__peek(&xsk->rx, opt_batch_size, &idx_rx);
 	if (!rcvd) {
-		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->umem->fq)) {
+		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(fq_ptr)) {
 			xsk->app_stats.rx_empty_polls++;
 			recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 		}
 		return;
 	}
 
-	ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+	ret = xsk_ring_prod__reserve(fq_ptr, rcvd, &idx_fq);
 	while (ret != rcvd) {
 		if (ret < 0)
 			exit_with_error(-ret);
-		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->umem->fq)) {
+		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(fq_ptr)) {
 			xsk->app_stats.fill_fail_polls++;
 			recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 		}
-		ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+		ret = xsk_ring_prod__reserve(fq_ptr, rcvd, &idx_fq);
 	}
 
 	for (i = 0; i < rcvd; i++) {
@@ -1488,10 +1626,10 @@ static void rx_drop(struct xsk_socket_info *xsk)
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
 		hex_dump(pkt, len, addr);
-		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = orig;
+		*xsk_ring_prod__fill_addr(fq_ptr, idx_fq++) = orig;
 	}
 
-	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
+	xsk_ring_prod__submit(fq_ptr, rcvd);
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	xsk->ring_stats.rx_npkts += rcvd;
 }
@@ -1704,7 +1842,12 @@ static void l2fwd(struct xsk_socket_info *xsk)
 
 	rcvd = xsk_ring_cons__peek(&xsk->rx, opt_batch_size, &idx_rx);
 	if (!rcvd) {
-		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(&xsk->umem->fq)) {
+#ifdef MULTI_FCQ
+		struct xsk_ring_prod *fq_ptr = &xsk->fq;
+#else
+		struct xsk_ring_prod *fq_ptr = &xsk->umem->fq;
+#endif
+		if (opt_busy_poll || xsk_ring_prod__needs_wakeup(fq_ptr)) {
 			xsk->app_stats.rx_empty_polls++;
 			recvfrom(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 		}
@@ -1798,6 +1941,8 @@ static void load_xdp_program(char **argv, struct bpf_object **obj)
 		fprintf(stderr, "ERROR: link set xdp fd failed\n");
 		exit(EXIT_FAILURE);
 	}
+
+	fprintf(stdout, "XDP Program loaded: %s", xdpsock_krnl);
 }
 
 static void enter_xsks_into_map(struct bpf_object *obj)
@@ -1823,6 +1968,8 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
 			exit(EXIT_FAILURE);
 		}
+
+		fprintf(stdout, "Inserted XSK[%d] fd:%d into xsks_map", i, fd);
 	}
 }
 
@@ -1953,13 +2100,24 @@ int main(int argc, char **argv)
 		/* Use libbpf 1.0 API mode */
 		libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
+#ifndef MULTI_FCQ
+		/* Only check this if we're in single-FCQ mode. */
 		if (opt_num_xsks > 1)
+#endif
 			load_xdp_program(argv, &obj);
 	}
 
+	fprintf(stdout, "--- Bringing up %u AF_XDP sockets in %s mode...\n", opt_num_xsks,
+#ifdef MULTI_FCQ
+		"Multi-FCQ"
+#else
+		"Single-FCQ"
+#endif
+	);
+
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
 #ifdef MULTI_FCQ
-	bufs = mmap(NULL, (NUM_FRAMES * opt_xsk_frame_size) * MAX_SOCKS,
+	bufs = mmap(NULL, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks,
 		    PROT_READ | PROT_WRITE,
 		    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
 #else
@@ -1974,21 +2132,33 @@ int main(int argc, char **argv)
 
 	/* Create sockets... */
 #ifdef MULTI_FCQ
-	umem = xsk_configure_umem(bufs, (NUM_FRAMES * opt_xsk_frame_size) * MAX_SOCKS);
+	umem = xsk_configure_umem(bufs, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks);
 #else
 	umem = xsk_configure_umem(bufs, NUM_FRAMES * opt_xsk_frame_size);
 #endif
 	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
 		rx = true;
-#ifndef MULTI_FCQ
-		/* In a multi-fcq setup we don't fill yet, because we need to create the xsk sockets */
+#ifdef MULTI_FCQ
+		/* In multi-fcq setup we don't fill here, we need XSK's to be setup */
+#else
+		/* In a single-fcq setup we fill here before XSKs are setup */
 		xsk_populate_fill_ring(umem);
 #endif
 	}
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
 		tx = true;
 	for (i = 0; i < opt_num_xsks; i++)
+#ifdef MULTI_FCQ
+		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx, i);
+#else
 		xsks[num_socks++] = xsk_configure_socket(umem, rx, tx);
+#endif
+
+#ifdef MULTI_FCQ
+	/* In a multi-fcq setup we fill via each XSK FQ. */
+	for (i = 0; i < opt_num_xsks; i++)
+		xsk_populate_fill_ring_xsk(umem, xsks[i]);
+#endif
 
 	for (i = 0; i < opt_num_xsks; i++)
 		apply_setsockopt(xsks[i]);
@@ -2003,7 +2173,12 @@ int main(int argc, char **argv)
 			gen_eth_frame(umem, i * opt_xsk_frame_size);
 	}
 
+#ifdef MULTI_FCQ
+	/* We need to insert our XSK irrespective of whether we have 1 channel or not */
+	if (opt_bench != BENCH_TXONLY)
+#else
 	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
+#endif
 		enter_xsks_into_map(obj);
 
 	if (opt_reduced_cap) {
@@ -2059,9 +2234,15 @@ out:
 	if (!opt_quiet)
 		pthread_join(pt, NULL);
 
+	fprintf(stdout, "- Shutting down -----------------------------------------------------------\n");
+
 	xdpsock_cleanup();
 
+#ifdef MULTI_FCQ
+	munmap(bufs, (NUM_FRAMES * opt_xsk_frame_size) * opt_num_xsks);
+#else
 	munmap(bufs, NUM_FRAMES * opt_xsk_frame_size);
+#endif
 
 	return 0;
 }
