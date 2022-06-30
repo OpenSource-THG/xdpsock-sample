@@ -296,7 +296,7 @@ static unsigned long get_nsecs(void)
 	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
 }
 
-static void print_benchmark(bool running)
+static void print_benchmark(struct xsk_socket_info *xsk, bool running)
 {
 	const char *bench_str = "INVALID";
 
@@ -307,7 +307,7 @@ static void print_benchmark(bool running)
 	else if (opt_bench == BENCH_L2FWD)
 		bench_str = "l2fwd";
 
-	printf("%s:%d %s ", opt_if, opt_queue, bench_str);
+	printf("%s:%u %s ", opt_if, xsk->channel_id, bench_str);
 	if (opt_xdp_flags & XDP_FLAGS_SKB_MODE)
 		printf("xdp-skb ");
 	else if (opt_xdp_flags & XDP_FLAGS_DRV_MODE)
@@ -511,7 +511,7 @@ static void dump_stats(void)
 			 1000000000. / dt;
 
 		printf("\n sock%d@", i);
-		print_benchmark(false);
+		print_benchmark(xsks[i], false);
 		printf("\n");
 
 		printf("%-18s %-14s %-14s %-14.2f\n", "", "pps", "pkts",

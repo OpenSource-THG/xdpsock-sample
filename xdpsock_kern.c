@@ -58,11 +58,11 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 
 	if (bpf_map_lookup_elem(&xsks_map, &rr))
 	{
-		odbpf_debug("[%s] Redirecting to rr=%u", QTYPE, rr);
+		odbpf_debug("[%s][%u] Redirecting to rr=%u", QTYPE, ctx->rx_queue_index, rr);
 		return bpf_redirect_map(&xsks_map, rr, 0);
 	}
 
-	odbpf_debug("[%s] Lookup failed on rr=%u", QTYPE, rr);
+	odbpf_debug("[%s][%u] Lookup failed on rr=%u", QTYPE, ctx->rx_queue_index, rr);
 	return XDP_DROP;
 }
 
