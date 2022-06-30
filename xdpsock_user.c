@@ -496,6 +496,8 @@ static void dump_stats(void)
 
 	prev_time = now;
 
+	fprintf(stdout, "----------------------------------------------------------------------\n");
+
 	for (i = 0; i < num_socks && xsks[i]; i++) {
 		char *fmt = "%-18s %'-14.0f %'-14lu\n";
 		double rx_pps, tx_pps, dropped_pps, rx_invalid_pps, full_pps, fill_empty_pps,
@@ -1030,7 +1032,8 @@ static void xsk_populate_fill_ring_xsk(struct xsk_umem_info *umem, struct xsk_so
 	 * means our umem offset for each descriptor is not uniform - and is different on a per-FQ/CQ
 	 * basis. */
 
-	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu", xsk->xsks_idx, xsk->umem_offset);
+	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu\n",
+		xsk->xsks_idx, xsk->umem_offset);
 
 	ret = xsk_ring_prod__reserve(&xsk->fq,
 				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
@@ -1127,13 +1130,15 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	/* In a multi-FCQ setup we use the xsk_socket__create_shared() API which lets us pass
 	 * in pointers to dedicated Fill/Completion queue per XSK. */
 
-	 fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n", xsk_index, opt_if, channel_id);
+	 fprintf(stdout, "Opening multi-FCQ XSK[%u] to %s channel %u...\n",
+	 	xsk_index, opt_if, channel_id);
 	 ret = xsk_socket__create_shared(&xsk->xsk, opt_if, channel_id, umem->umem,
 	 			rxr, txr, &xsk->fq, &xsk->cq, &cfg);
 
 #else /* MULTI_FCQ */
 	
-	fprintf(stdout, "Opening single-FCQ XSK to %s channel %u...\n", opt_if, opt_queue);
+	fprintf(stdout, "Opening single-FCQ XSK to %s channel %u...\n",
+		opt_if, opt_queue);
 	ret = xsk_socket__create(&xsk->xsk, opt_if, opt_queue, umem->umem,
 				 rxr, txr, &cfg);
 
@@ -1289,7 +1294,11 @@ static void parse_command_line(int argc, char **argv)
 
 	for (;;) {
 		c = getopt_long(argc, argv,
+#ifdef MULTI_FCQ
+				"Frtli:q:pSNn:w:O:czf:muM:d:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BR",
+#else
 				"Frtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BR",
+#endif
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1648,9 +1657,18 @@ static void rx_drop_all(void)
 		if (opt_poll) {
 			for (i = 0; i < num_socks; i++)
 				xsks[i]->app_stats.opt_polls++;
+
 			ret = poll(fds, num_socks, opt_timeout);
 			if (ret <= 0)
+#ifndef USE_ORIGINAL
 				continue;
+#else
+			{
+				if (benchmark_done)
+					break;
+				continue;
+			}
+#endif /* USE_ORIGINAL */
 		}
 
 		for (i = 0; i < num_socks; i++)
@@ -1916,18 +1934,12 @@ static void l2fwd_all(void)
 
 static void load_xdp_program(char **argv, struct bpf_object **obj)
 {
-	int prog_fd;
 	struct bpf_prog_load_attr prog_load_attr = {
 		.prog_type      = BPF_PROG_TYPE_XDP,
 	};
+	int prog_fd;
 
-#ifdef USE_ORIGINAL
-	char xdp_filename[256];
-	snprintf(xdp_filename, sizeof(xdp_filename), "%s_kern.o", argv[0]);
-	prog_load_attr.file = xdp_filename;
-#else
 	prog_load_attr.file = xdpsock_krnl;
-#endif /* USE_ORIGINAL */
 
 	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
 		exit(EXIT_FAILURE);
@@ -1942,7 +1954,7 @@ static void load_xdp_program(char **argv, struct bpf_object **obj)
 		exit(EXIT_FAILURE);
 	}
 
-	fprintf(stdout, "XDP Program loaded: %s", xdpsock_krnl);
+	fprintf(stdout, "XDP Program loaded: %s\n", xdpsock_krnl);
 }
 
 static void enter_xsks_into_map(struct bpf_object *obj)
@@ -1959,6 +1971,15 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 	}
 
 	for (i = 0; i < num_socks; i++) {
+#ifdef MUTLI_FCQ
+		if (i != xsks[i]->xsks_idx);
+		{
+			fprintf(stderr, "ERROR: xsk with invalid xsks_id at index (xsks_idx:%u, i:%d)\n",
+				xsks[i]->xsks_id, i);
+			exit(EXIT_FAILURE);
+		}
+#endif
+
 		int fd = xsk_socket__fd(xsks[i]->xsk);
 		int key, ret;
 
@@ -1969,7 +1990,7 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 			exit(EXIT_FAILURE);
 		}
 
-		fprintf(stdout, "Inserted XSK[%d] fd:%d into xsks_map", i, fd);
+		fprintf(stdout, "Inserted XSK[%d] fd:%d into xsks_map\n", i, fd);
 	}
 }
 
@@ -2107,7 +2128,7 @@ int main(int argc, char **argv)
 			load_xdp_program(argv, &obj);
 	}
 
-	fprintf(stdout, "--- Bringing up %u AF_XDP sockets in %s mode...\n", opt_num_xsks,
+	fprintf(stdout, "Bringing up %u AF_XDP sockets in %s mode...\n", opt_num_xsks,
 #ifdef MULTI_FCQ
 		"Multi-FCQ"
 #else
@@ -2233,8 +2254,6 @@ out:
 
 	if (!opt_quiet)
 		pthread_join(pt, NULL);
-
-	fprintf(stdout, "- Shutting down -----------------------------------------------------------\n");
 
 	xdpsock_cleanup();
 

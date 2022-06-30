@@ -14,9 +14,7 @@ XDPTOOLS_CONFIG_MK="config.mk"
 
 BUILDDEPS=1
 MAX_SOCKS=2
-MULTI_FCQ=
 TARGZ=
-XDPSOCK_KRNL="xdpsock_kern.bpf"
 
 function features_needed()
 {
@@ -82,8 +80,12 @@ function build_xdptools()
 # Build xdpsock user-space application
 function build_xdpsock_app()
 {
+	local name="${1}"
+	[ ! -z "${name}" ] || fatal "xdpsock app name missing"
+
 	local usrsrc="xdpsock_user.c"
-	local usrobj="xdpsock_user"
+	local usrobj="${name}"
+	local krnlobj="${name}.bpf"
 	local libbpf_static="${XDPTOOLS_PATH}/lib/libbpf/src/libbpf.a"
 	local libbpf_headers="${XDPTOOLS_PATH}/lib/libbpf/src/root/usr/include"
 	local libxdp_static="${XDPTOOLS_PATH}/lib/libxdp/libxdp.a"
@@ -91,7 +93,8 @@ function build_xdpsock_app()
 
 	# Build xdpsock user app
 	local build_cmd="${GCC} -I. -I${libxdp_headers} -I${libbpf_headers}"
-	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${MULTI_FCQ} -DXDPSOCK_KRNL=\"${XDPSOCK_KRNL}\""
+	build_cmd="${build_cmd} -Wall -g -O2 -DMAX_SOCKS=${MAX_SOCKS} ${FCQ_DEFINE}"
+	build_cmd="${build_cmd} -DXDPSOCK_KRNL=\"${krnlobj}\""
 	build_cmd="${build_cmd} -o ${usrobj} ${usrsrc}"
 	build_cmd="${build_cmd} ${libxdp_static} ${libbpf_static} -lcap -pthread -lelf -lz"
 
@@ -111,14 +114,17 @@ function build_xdpsock_app()
 # Build xdpsock bpf object
 function build_xdpsock_bpf()
 {
+	local name="${1}"
+	[ ! -z "${name}" ] || fatal "xdpsock bpf name missing"
+
 	local bpfsrc="xdpsock_kern.c"
 	local bpfint="xdpsock_kern.ll"
-	local bpfobj="xdpsock_kern.bpf"
+	local bpfobj="${name}.bpf"
 	local libbpf_headers="${XDPTOOLS_PATH}/lib/libbpf/src/root/usr/include"
 
 	# Build xdpsock kernel app via clang
 	local build1_cmd="${CLANG} -I. -I${libbpf_headers} -D__KERNEL__ -D__BPF_TRACING__"
-	build1_cmd="${build1_cmd} -DMAX_SOCKS=${MAX_SOCKS} -Wall -g -O2"
+	build1_cmd="${build1_cmd} -DMAX_SOCKS=${MAX_SOCKS} ${FCQ_DEFINE} -Wall -g -O2"
 	build1_cmd="${build1_cmd} -target bpf -S -emit-llvm ${bpfsrc} -o ${bpfint}"
 	local build2_cmd="${LLC} -march=bpf -filetype=obj ${bpfint} -o ${bpfobj}"
 
@@ -145,7 +151,7 @@ function build_xdpsock_bpf()
 # Tar up binary files
 function tar_xdpsock()
 {
-	local files="xdpsock_user ${XDPSOCK_KRNL}"
+	local files="${1} ${1}.bpf ${2} ${2}.bpf"
 	local tar="xdpsock.tar.gz"
 
 	rm -f "${tar}"
@@ -174,27 +180,17 @@ while (( "$#" )); do
 			;;
 		--cleanup)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
-			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
+			rm -f *.o *.bpf *.ll *.tar.gz xdpsock_single xdpsock_multi
 			exit 0
 			;;
 		--clean)
 			${MAKE} -C "${XDPTOOLS_PATH}" distclean
-			rm -f xdpsock_user.o xdpsock_kern.ll xdpsock_kern.bpf
+			rm -f *.o *.bpf *.ll *.tar.gz xdpsock_single xdpsock_multi
 			shift
 			;;
 		--max-xsk)
 			[ $# -ge 2 ] || fatal "Insufficient args: --max-xsk <num>"
 			MAX_SOCKS="${2}"
-			shift
-			shift
-			;;
-		--multi-fcq)
-			MULTI_FCQ="-DMULTI_FCQ=1"
-			shift
-			;;
-		--bpf-object)
-			[ $# -ge 2 ] || fatal "Insufficient args: --bpf-object <object_filename>"
-			XDPSOCK_KRNL="${2}"
 			shift
 			shift
 			;;
@@ -215,6 +211,15 @@ done
 check_headers
 [ -z "${BUILDDEPS}" ] || git_submodule_prep
 [ -z "${BUILDDEPS}" ] || build_xdptools
-build_xdpsock_app
-build_xdpsock_bpf
-[ -z "${TARGZ}" ] || tar_xdpsock
+
+# Do a multi-FCQ build
+FCQ_DEFINE="-DMULTI_FCQ=1"
+build_xdpsock_app "xdpsock_multi"
+build_xdpsock_bpf "xdpsock_multi"
+
+# Do a single-FCQ build
+FCQ_DEFINE=""
+build_xdpsock_app "xdpsock_single"
+build_xdpsock_bpf "xdpsock_single"
+
+[ -z "${TARGZ}" ] || tar_xdpsock "xdpsock_multi" "xdpsock_single"

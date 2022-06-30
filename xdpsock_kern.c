@@ -23,7 +23,12 @@ static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
+#ifdef MULTI_FCQ
+	/* In a multi-FCQ setup we lookup the rx channel ID in our xsk map */
+	rr = ctx->rx_queue_index;
+#else
 	rr = (rr + 1) & (MAX_SOCKS - 1);
+#endif
 
 	return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
 }

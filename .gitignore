@@ -1,4 +1,5 @@
-xdpsock_user
+xdpsock_single
+xdpsock_multi
 config.mk
 *.tar.gz
 *.bpf
