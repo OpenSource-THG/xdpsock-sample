@@ -1048,7 +1048,7 @@ static void xsk_populate_fill_ring(struct xsk_umem_info *umem, struct xsk_socket
 	if (umem == NULL || xsk != NULL)
 		exit_with_error(-EINVAL);
 
-	fprintf(stdout, "Filling single-FCQ XSK[%u]\n", xsk->xsk_index);
+	fprintf(stdout, "Filling single-FCQ XSK\n");
 	
 	/* Single MCQ mode, so we fill the umem->fq. */
 	struct xsk_ring_prod *fq_ptr = &umem->fq;
