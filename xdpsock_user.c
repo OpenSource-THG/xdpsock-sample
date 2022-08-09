@@ -633,7 +633,8 @@ static void __exit_with_error(int error, const char *file, const char *func,
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func,
 		line, error, strerror(error));
 
-#ifdef USE_ORIGINAL
+#ifndef MULTI_FCQ
+	/* In single FCQ mode, we only have an XDP program laoded if num_xsks > 1. */
 	if (opt_num_xsks > 1)
 #endif
 		remove_xdp_program();
@@ -657,7 +658,8 @@ static void xdpsock_cleanup(void)
 			exit_with_error(errno);
 	}
 
-#ifdef USE_ORIGINAL
+#ifndef MULTI_FCQ
+	/* In single FCQ mode, we only have an XDP program laoded if num_xsks > 1. */
 	if (opt_num_xsks > 1)
 #endif
 		remove_xdp_program();
@@ -1091,19 +1093,20 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 
-#ifdef USE_ORIGINAL
+#ifdef MULTI_FCQ
 
+	/* We don't want to use dispatcher - we always want to load our kernel. */
+	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+
+#else
+
+	/* Original code */
 	if (opt_num_xsks > 1 || opt_reduced_cap)
 		cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	else
 		cfg.libbpf_flags = 0;
 
-#else
-
-	/* We don't want to use dispatcher - we always want to load our kernel. */
-	cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
-
-#endif /* USE_ORIGINAL */
+#endif /* MULTI_FCQ */
 
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags;
@@ -2157,9 +2160,8 @@ int main(int argc, char **argv)
 		/* Use libbpf 1.0 API mode */
 		libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
-#ifdef USE_ORIGINAL
-		/* Original code used libxdp dispatch for 1 xsk, but we always use
-		 * our own bpf object. */
+#ifndef MULTI_FCQ
+		/* In a single-FCQ setup we only load a program if num_xsks > 1. */
 		if (opt_num_xsks > 1)
 #endif
 			load_xdp_program(argv, &obj);
@@ -2227,11 +2229,12 @@ int main(int argc, char **argv)
 			gen_eth_frame(umem, i * opt_xsk_frame_size);
 	}
 
-#ifdef USE_ORIGINAL
-	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
-#else
+#ifdef MULTI_FCQ
 	/* We need to insert our XSK irrespective of whether we have 1 channel or not */
 	if (opt_bench != BENCH_TXONLY)
+#else
+	/* In single FCQ mode we default to the original logic */
+	if (opt_num_xsks > 1 && opt_bench != BENCH_TXONLY)
 #endif
 		enter_xsks_into_map(obj);
 
