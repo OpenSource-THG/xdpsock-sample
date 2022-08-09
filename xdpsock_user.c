@@ -633,7 +633,9 @@ static void __exit_with_error(int error, const char *file, const char *func,
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func,
 		line, error, strerror(error));
 
+#ifdef USE_ORIGINAL
 	if (opt_num_xsks > 1)
+#endif
 		remove_xdp_program();
 	exit(EXIT_FAILURE);
 }
@@ -655,8 +657,7 @@ static void xdpsock_cleanup(void)
 			exit_with_error(errno);
 	}
 
-#ifndef MULTI_FCQ
-	/* Only check this if we're in single-FCQ mode. */
+#ifdef USE_ORIGINAL
 	if (opt_num_xsks > 1)
 #endif
 		remove_xdp_program();
@@ -1023,54 +1024,49 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 	return umem;
 }
 
-#ifdef MULTI_FCQ
-
-/* This is the multi-FCQ fill routine called after each XSK socket is created, and
- * feeds the XSK FQ with descriptors dedicated for that XSK. */
-
-static void xsk_populate_fill_ring_xsk(struct xsk_umem_info *umem, struct xsk_socket_info *xsk)
+static void xsk_populate_fill_ring(struct xsk_umem_info *umem, struct xsk_socket_info *xsk)
 {
 	int ret, i;
 	u32 idx;
 
-	/* In a multi-FCQ setup, umem size is multiplied by the number of XSK sockets we have. That
-	 * means our umem offset for each descriptor is not uniform - and is different on a per-FQ/CQ
-	 * basis. */
+#ifdef MULTI_FCQ
+	if (umem == NULL || xsk == NULL)
+		exit_with_error(-EINVAL);
 
 	fprintf(stdout, "Filling multi-FCQ XSK[%u] from umem_offset:%llu\n",
 		xsk->xsk_index, xsk->umem_offset);
 
-	ret = xsk_ring_prod__reserve(&xsk->fq,
-				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
-	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS * 2)
-		exit_with_error(-ret);
-	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS * 2; i++)
-		*xsk_ring_prod__fill_addr(&xsk->fq, idx++) =
-			xsk->umem_offset + (i * opt_xsk_frame_size);
-	xsk_ring_prod__submit(&xsk->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
-}
+	/* Multi FCQ mode, we fill the xsk->fq. */
+	struct xsk_ring_prod *fq_ptr = &xsk->fq;
+
+	/* In a multi-FCQ setup, umem size is multiplied by the number of XSK sockets we have. That
+	 * means our umem offset for each descriptor is not uniform - and is different on a per-FQ/CQ
+	 * basis. */
+	int offset = xsk->umem_offset;
 
 #else
+	if (umem == NULL || xsk != NULL)
+		exit_with_error(-EINVAL);
 
-/* This is the single-FCQ fill routine called after UMEM is created, but before
- * any XSK socket is created. */
+	fprintf(stdout, "Filling single-FCQ XSK[%u]\n", xsk->xsk_index);
+	
+	/* Single MCQ mode, so we fill the umem->fq. */
+	struct xsk_ring_prod *fq_ptr = &umem->fq;
 
-static void xsk_populate_fill_ring(struct xsk_umem_info *umem)
-{
-	int ret, i;
-	u32 idx;
+	/* Single MCQ mode, no per-xsk offset needed. */
+	int offset = 0;
 
-	ret = xsk_ring_prod__reserve(&umem->fq,
+#endif /* MULTI_FCQ */
+
+	ret = xsk_ring_prod__reserve(fq_ptr,
 				     XSK_RING_PROD__DEFAULT_NUM_DESCS * 2, &idx);
 	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS * 2)
 		exit_with_error(-ret);
 	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS * 2; i++)
-		*xsk_ring_prod__fill_addr(&umem->fq, idx++) =
-			i * opt_xsk_frame_size;
-	xsk_ring_prod__submit(&umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
+		*xsk_ring_prod__fill_addr(fq_ptr, idx++) =
+			offset + (i * opt_xsk_frame_size);
+	xsk_ring_prod__submit(fq_ptr, XSK_RING_PROD__DEFAULT_NUM_DESCS * 2);
 }
-
-#endif /* MULTI_FCQ */
 
 /* Original xsk_configure_socket() always binds to the same Channel ID, which is not multi-core.
  *
@@ -2006,7 +2002,7 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 
 	for (i = 0; i < num_socks; i++) {
 #ifdef MUTLI_FCQ
-		if (i != xsks[i]->xsk_index);
+		if (i != xsks[i]->xsk_index)
 		{
 			fprintf(stderr, "ERROR: xsk with invalid xsk_index at index (xsk_index:%u, i:%d)\n",
 				xsks[i]->xsk_index, i);
@@ -2162,6 +2158,8 @@ int main(int argc, char **argv)
 		libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
 #ifdef USE_ORIGINAL
+		/* Original code used libxdp dispatch for 1 xsk, but we always use
+		 * our own bpf object. */
 		if (opt_num_xsks > 1)
 #endif
 			load_xdp_program(argv, &obj);
@@ -2199,10 +2197,10 @@ int main(int argc, char **argv)
 	if (opt_bench == BENCH_RXDROP || opt_bench == BENCH_L2FWD) {
 		rx = true;
 #ifdef MULTI_FCQ
-		/* In multi-fcq setup we don't fill here, we need XSK's to be setup */
+		/* In multi-fcq setup we don't fill here, we need XSK's to be setup. */
 #else
 		/* In a single-fcq setup we fill here before XSKs are setup */
-		xsk_populate_fill_ring(umem);
+		xsk_populate_fill_ring(umem, NULL);
 #endif
 	}
 	if (opt_bench == BENCH_L2FWD || opt_bench == BENCH_TXONLY)
@@ -2213,7 +2211,7 @@ int main(int argc, char **argv)
 #ifdef MULTI_FCQ
 	/* In a multi-fcq setup we fill via each XSK FQ. */
 	for (i = 0; i < opt_num_xsks; i++)
-		xsk_populate_fill_ring_xsk(umem, xsks[i]);
+		xsk_populate_fill_ring(umem, xsks[i]);
 #endif
 
 	for (i = 0; i < opt_num_xsks; i++)

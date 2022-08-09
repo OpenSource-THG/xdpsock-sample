@@ -16,6 +16,7 @@ BUILDDEPS=1
 MAX_SOCKS=2
 DEBUG=
 TARGZ=
+V=0
 
 function features_needed()
 {
@@ -55,13 +56,13 @@ function check_headers()
 function git_submodule_prep()
 {
 	${GIT} submodule init
-	${GIT} submodule update --remote --force --recursive
+	${GIT} submodule update #--remote --force --recursive
 	[ -d "${XDPTOOLS_PATH}" ] || fatal "Can't find XDPTOOLS_PATH: ${XDPTOOLS_PATH}"
 	[ -f "${XDPTOOLS_CONFIGURE}" ] || fatal "Can't find XDPTOOLS_CONIFGURE: ${XDPTOOLS_CONFIGURE}"
 
 	# there's probably a saner way to do this, but also init xdp-tools submodules
-	${GIT} -C "${XDPTOOLS_PATH}" init
-	${GIT} -C "${XDPTOOLS_PATH}" update --remote --force --recursive
+	${GIT} -C "${XDPTOOLS_PATH}" submodule init
+	${GIT} -C "${XDPTOOLS_PATH}" submodule update #--remote --force --recursive
 }
 
 # Build xpdtools
@@ -75,7 +76,7 @@ function build_xdptools()
 	mv "${XDPTOOLS_CONFIG_MK}" "${XDPTOOLS_PATH}"
 
 	# try compile
-	${MAKE} -C ${XDPTOOLS_PATH} V=0
+	${MAKE} -C ${XDPTOOLS_PATH} V=${V} || fatal "xdptools build failed"
 }
 
 # Build xdpsock user-space application
@@ -201,6 +202,10 @@ while (( "$#" )); do
 			;;
 		--tar)
 			TARGZ=1
+			shift
+			;;
+		--verbose)
+			V=1
 			shift
 			;;
 		*)
