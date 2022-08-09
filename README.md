@@ -23,8 +23,7 @@ completion queues (referred to in this code as "Multi-FCQ").
 The original code relies on the xdp "dispatcher" if only using 1 XSK, and only uses the
 provided xdpsock_kern object if you have "shared UMEM" mode enabled.
 
-This logic is now gated with `USE_ORIGINAL` and turned off by default. We should now always
-use our provided xdpsock_kern object.
+This logic is altered in Multi-FCQ mode, always loading the xdpsock_kern object.
 
 ## Change 2 - Poll mode exit
 
