@@ -27,6 +27,19 @@
 #define odbpf_debug(fmt, args...)
 #endif /* USE_DEBUGMODE */
 
+/*
+ * Swaps destination and source MAC addresses inside an Ethernet header
+ */
+static __always_inline void
+xdp_sock_swap_src_dst_mac(struct ethhdr *eth)
+{
+        __u8 h_tmp[6];
+
+        __builtin_memcpy(h_tmp, eth->h_source, 6);
+        __builtin_memcpy(eth->h_source, eth->h_dest, 6);
+        __builtin_memcpy(eth->h_dest, h_tmp, 6);
+}
+
 /* This XDP program is only needed for the XDP_SHARED_UMEM mode.
  * If you do not use this mode, libbpf can supply an XDP program for you.
  */
@@ -37,8 +50,6 @@ struct {
 	__uint(key_size, sizeof(int));
 	__uint(value_size, sizeof(int));
 } xsks_map SEC(".maps");
-
-static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
@@ -52,22 +63,10 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 	if (eth->h_proto == 1544)
 		return XDP_PASS;
 	
-#ifdef MULTI_FCQ
-	/* In a multi-FCQ setup we lookup the rx channel ID in our xsk map */
-	rr = ctx->rx_queue_index;
-#else
-	/* In a single-FCQ setup we roundrobin between sockets. */
-	rr = (rr + 1) & (MAX_SOCKS - 1);
-#endif
+	odbpf_debug("DDOS: Transmitting, we do not want to send this to userspace.");
+	xdp_sock_swap_src_dst_mac(eth);
+	return XDP_TX;
 
-	if (bpf_map_lookup_elem(&xsks_map, &rr))
-	{
-		odbpf_debug("[%s][%u] Redirecting to rr=%u", QTYPE, ctx->rx_queue_index, rr);
-		return bpf_redirect_map(&xsks_map, rr, 0);
-	}
-
-	odbpf_debug("[%s][%u] Lookup failed on rr=%u", QTYPE, ctx->rx_queue_index, rr);
-	return XDP_DROP;
 }
 
 char _license[] SEC("license") = "Dual BSD/GPL";
