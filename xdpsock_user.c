@@ -1963,22 +1963,55 @@ static void l2fwd_all(void)
 	}
 }
 
-static void load_xdp_program(char **argv, struct bpf_object **obj)
+static struct bpf_object *load_xdp_program(char **argv)
 {
-	struct bpf_prog_load_attr prog_load_attr = {
-		.prog_type      = BPF_PROG_TYPE_XDP,
-	};
+	struct bpf_object *bpf_obj = NULL;
+	struct bpf_program *bpf_prog = NULL;
 	int prog_fd;
+	int err;
 
-	prog_load_attr.file = xdpsock_krnl;
+	fprintf(stdout, "Our XDP kernel is: %s\n", xdpsock_krnl);
 
-	fprintf(stdout, "Our XDP kernel is: %s\n", prog_load_attr.file);
-
-	if (bpf_prog_load_xattr(&prog_load_attr, obj, &prog_fd))
+	bpf_obj = bpf_object__open_file(xdpsock_krnl, NULL);
+	if (bpf_obj == NULL)
+	{
+		fprintf(
+			stdout, "Error opening the BPF object: %s, %s", xdpsock_krnl, strerror(errno));
 		exit(EXIT_FAILURE);
+	}
+
+	bpf_prog = bpf_object__find_program_by_name(bpf_obj, "xdp_sock_prog");
+	if (bpf_prog == NULL)
+	{
+		/* Don't take a risk with this. If our section name can't be found, close the
+		 * object. This will also close the object FD. */
+		bpf_object__close(bpf_obj);
+		bpf_obj = NULL;
+		fprintf(stdout,
+		               "Error loading BPF program: %s: section_name %s not found",
+		               xdpsock_krnl,
+		               "xdp_sock_prog");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Set the type of the program after we have found it from the section name. */
+	bpf_program__set_type(bpf_prog, BPF_PROG_TYPE_XDP);
+
+	/* Now we have found the program and set up the program type, we can load
+	 * the BPF object into the kernel. */
+	err = bpf_object__load(bpf_obj);
+	if (err != 0)
+	{
+		bpf_object__close(bpf_obj);
+		char errbuf[256];
+		libbpf_strerror(err, errbuf, sizeof(errbuf));
+		fprintf(stdout, "Error loading BPF object: %s: %s", xdpsock_krnl, errbuf);
+		exit(EXIT_FAILURE);
+	}
+
+	prog_fd = bpf_program__fd(bpf_prog);
 	if (prog_fd < 0) {
-		fprintf(stderr, "ERROR: no program found: %s\n",
-			strerror(prog_fd));
+		printf("program not found: %s\n", strerror(prog_fd));
 		exit(EXIT_FAILURE);
 	}
 
@@ -1987,6 +2020,7 @@ static void load_xdp_program(char **argv, struct bpf_object **obj)
 		exit(EXIT_FAILURE);
 	}
 
+	return bpf_obj;
 	fprintf(stdout, "XDP Program loaded: %s\n", xdpsock_krnl);
 }
 
@@ -2164,7 +2198,7 @@ int main(int argc, char **argv)
 		/* In a single-FCQ setup we only load a program if num_xsks > 1. */
 		if (opt_num_xsks > 1)
 #endif
-			load_xdp_program(argv, &obj);
+			obj = load_xdp_program(argv);
 	}
 
 	fprintf(stdout, "Bringing up %u AF_XDP sockets in %s mode...\n", opt_num_xsks,
@@ -2227,6 +2261,12 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < NUM_FRAMES; i++)
 			gen_eth_frame(umem, i * opt_xsk_frame_size);
+	}
+
+	if (obj == NULL)
+	{
+		fprintf(stderr, "BPF Object is still NULL\n");
+		exit(EXIT_FAILURE);
 	}
 
 #ifdef MULTI_FCQ
