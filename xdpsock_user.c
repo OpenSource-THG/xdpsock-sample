@@ -135,6 +135,7 @@ static int irqs_at_init = -1;
 static u32 sequence;
 static int opt_poll;
 static int opt_interval = 1;
+static int bpfstats_fd;
 static int opt_retries = 3;
 static u32 opt_xdp_bind_flags = XDP_USE_NEED_WAKEUP;
 static u32 opt_umem_flags;
@@ -152,6 +153,7 @@ static unsigned long opt_tx_cycle_ns;
 static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
+static struct stats_record prev, record = { 0 };
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -490,6 +492,117 @@ static void dump_driver_stats(long dt)
 	}
 }
 
+#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
+static __u64 gettime(void)
+{
+	struct timespec t;
+	int res;
+
+	res = clock_gettime(CLOCK_MONOTONIC, &t);
+	if (res < 0) {
+		fprintf(stderr, "Error with gettimeofday! (%i)\n", res);
+		exit(1);
+	}
+	return (__u64) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
+}
+
+static const char *xdp_action_names[XDP_ACTION_MAX] = {
+	[XDP_ABORTED]   = "XDP_ABORTED",
+	[XDP_DROP]      = "XDP_DROP",
+	[XDP_PASS]      = "XDP_PASS",
+	[XDP_TX]        = "XDP_TX",
+	[XDP_REDIRECT]  = "XDP_REDIRECT",
+};
+
+const char *action2str(__u32 action)
+{
+        if (action < XDP_ACTION_MAX)
+                return xdp_action_names[action];
+        return NULL;
+}
+
+static void stats_print(struct stats_record *stats_rec,
+			struct stats_record *stats_prev)
+{
+	struct record *rec, *prev;
+	__u64 packets, bytes;
+	double pps; /* packets per sec */
+	double bps; /* bits per sec */
+	int i;
+
+	/* Print stats "header" */
+	printf("%-12s\n", "XDP-action");
+
+	/* Print for each XDP actions stats */
+	for (i = 0; i < XDP_ACTION_MAX; i++)
+	{
+		char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
+			" %'11lld Kbytes (%'6.0f Mbits/s)\n";
+		const char *action = action2str(i);
+
+		rec  = &stats_rec->stats[i];
+		prev = &stats_prev->stats[i];
+
+		packets = rec->total.rx_packets - prev->total.rx_packets;
+		pps     = packets;
+
+		bytes   = rec->total.rx_bytes   - prev->total.rx_bytes;
+		bps     = (bytes * 8) / 1000000;
+
+		printf(fmt, action, rec->total.rx_packets, pps,
+		       rec->total.rx_bytes / 1000 , bps);
+	}
+	printf("\n");
+}
+
+/* BPF_MAP_TYPE_PERCPU_ARRAY */
+void map_get_value_percpu_array(int fd, __u32 key, struct datarec *value)
+{
+	/* For percpu maps, userspace gets a value per possible CPU */
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	struct datarec values[nr_cpus];
+	__u64 sum_bytes = 0;
+	__u64 sum_pkts = 0;
+	int i;
+
+	if ((bpf_map_lookup_elem(fd, &key, values)) != 0) {
+		fprintf(stderr,
+			"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
+		return;
+	}
+
+	/* Sum values from each CPU */
+	for (i = 0; i < nr_cpus; i++) {
+		sum_pkts  += values[i].rx_packets;
+		sum_bytes += values[i].rx_bytes;
+	}
+	value->rx_packets = sum_pkts;
+	value->rx_bytes   = sum_bytes;
+}
+
+static bool map_collect(int fd, __u32 map_type, __u32 key, struct record *rec)
+{
+	struct datarec value;
+
+	/* Get time as close as possible to reading map contents */
+	rec->timestamp = gettime();
+
+	switch (map_type) {
+	case BPF_MAP_TYPE_PERCPU_ARRAY:
+		map_get_value_percpu_array(fd, key, &value);
+		break;
+	default:
+		fprintf(stderr, "ERR: Unknown map_type(%u) cannot handle\n",
+			map_type);
+		return false;
+		break;
+	}
+
+	rec->total.rx_packets = value.rx_packets;
+	rec->total.rx_bytes   = value.rx_bytes;
+	return true;
+}
+
 static void dump_stats(void)
 {
 	unsigned long now = get_nsecs();
@@ -502,6 +615,11 @@ static void dump_stats(void)
 #ifdef USE_DEBUGMODE
 	fprintf(stdout, " *** WARNING - Debugmode is enabled - performance may not be good ***\n");
 #endif
+
+	prev = record;
+	for (unsigned int key = 0; key < XDP_ACTION_MAX; key++)
+		map_collect(bpfstats_fd, BPF_MAP_TYPE_PERCPU_ARRAY, key, &record.stats[key]);
+	stats_print(&record, &prev);
 
 	for (i = 0; i < num_socks && xsks[i]; i++) {
 		char *fmt = "%-18s %'-14.0f %'-14lu\n";
@@ -2059,7 +2177,7 @@ static void enter_xsks_into_map(struct bpf_object *obj)
 #endif
 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
 		if (ret) {
-			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+			fprintf(stderr, "ERROR: bpf_map_update_elem %d, ret: %d\n", i, ret);
 			exit(EXIT_FAILURE);
 		}
 
@@ -2155,6 +2273,18 @@ recv_xsks_map_fd(int *xsks_map_fd)
 		return err;
 	}
 	return 0;
+}
+
+int xdpsock_open_bpfstats_map(struct bpf_object *obj)
+{
+	struct bpf_map *map_ptr;
+	map_ptr = bpf_object__find_map_by_name(obj, "bpfstats");
+
+	int bpfstats_fd = bpf_map__fd(map_ptr);
+	if (bpfstats_fd < 0) {
+		return -1;
+	}
+	return bpfstats_fd;
 }
 
 int main(int argc, char **argv)
@@ -2292,6 +2422,8 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+
+	bpfstats_fd = xdpsock_open_bpfstats_map(obj);
 
 	signal(SIGINT, int_exit);
 	signal(SIGTERM, int_exit);
